@@ -1,8 +1,9 @@
 """Revanced Parser."""
 
+import json
 from subprocess import PIPE, Popen
 from time import perf_counter
-from typing import Self
+from typing import Any, Self
 
 from loguru import logger
 
@@ -22,7 +23,7 @@ class Parser(object):
     PATCHES_ARG = "-p"
     OUTPUT_ARG = "-o"
     KEYSTORE_ARG = "--keystore"
-    OPTIONS_ARG = "--options"
+    OPTIONS_ARG = "-O"
 
     def __init__(self: Self, patcher: Patches, config: RevancedConfig) -> None:
         self._PATCHES: list[str] = []
@@ -30,15 +31,47 @@ class Parser(object):
         self.patcher = patcher
         self.config = config
 
-    def include(self: Self, name: str) -> None:
-        """The function `include` adds a given patch to a list of patches.
+    def format_option(self: Self, opt: dict[str, Any]) -> str:
+        """
+        The function `include` adds a given patch to the front of a list of patches.
+
+        Parameters
+        ----------
+        opt : dict[str, Any]
+            The `opt` parameter is a dictionary that represents the key-value pair of options
+            of the patch to be included.
+        """
+        pair: str = opt["key"]
+        if value := opt.get("value"):
+            if isinstance(value, bool):
+                pair += f'="{str(value).lower()}"'
+            elif isinstance(value, (int, float)):
+                pair += f"={value}"  # Numbers should not be quoted
+            elif isinstance(value, list):
+                formatted_list = ",".join(map(str, value))
+                pair += f'="[ {formatted_list} ]"'  # Preserve list format
+            else:
+                pair += f'="{value}"'
+        return pair
+
+    def include(self: Self, name: str, options_list: list[dict[str, Any]]) -> None:
+        """
+        The function `include` adds a given patch to the front of a list of patches.
 
         Parameters
         ----------
         name : str
             The `name` parameter is a string that represents the name of the patch to be included.
+        options_list : list[dict[str, Any]]
+            Then `options_list` parameter is a list of dictionary that represents the options for all patches.
         """
-        self._PATCHES.extend(["-e", name])
+        options_dict: dict[str, Any] = self.fetch_patch_options(name, options_list)
+        options = options_dict.get("options", [])
+        if options:
+            for opt in options:
+                pair = self.format_option(opt)
+                self._PATCHES[:0] = [self.OPTIONS_ARG, pair]
+        self._PATCHES[:0] = ["-e", name]
 
     def exclude(self: Self, name: str) -> None:
         """The `exclude` function adds a given patch to the list of excluded patches.
@@ -61,7 +94,7 @@ class Parser(object):
         return self._EXCLUDED
 
     def get_all_patches(self: Self) -> list[str]:
-        """The function "get_all_patches" is a getter method that returns a ist of all patches.
+        """The function "get_all_patches" is a getter method that returns the list of all patches.
 
         Returns
         -------
@@ -84,11 +117,10 @@ class Parser(object):
         """
         try:
             name = name.lower().replace(" ", "-")
-            patch_index = self._PATCHES.index(name)
             indices = [i for i in range(len(self._PATCHES)) if self._PATCHES[i] == name]
             for patch_index in indices:
                 if self._PATCHES[patch_index - 1] == "-e":
-                    self._PATCHES[patch_index - 1] = "-i"
+                    self._PATCHES[patch_index - 1] = "-d"
                 else:
                     self._PATCHES[patch_index - 1] = "-e"
         except ValueError:
@@ -99,8 +131,25 @@ class Parser(object):
     def exclude_all_patches(self: Self) -> None:
         """The function `exclude_all_patches` exclude all the patches."""
         for idx, item in enumerate(self._PATCHES):
-            if item == "-i":
-                self._PATCHES[idx] = "-e"
+            if idx == 0:
+                continue
+            if item == "-e":
+                self._PATCHES[idx] = "-d"
+
+    def fetch_patch_options(self: Self, name: str, options_list: list[dict[str, Any]]) -> dict[str, Any]:
+        """The function `fetch_patch_options` finds patch options for the patch.
+
+        Parameters
+        ----------
+        name : str
+            Then `name` parameter is a string that represents the name of the patch.
+        options_list : list[dict[str, Any]]
+            Then `options_list` parameter is a list of dictionary that represents the options for all patches.
+        """
+        return next(
+            filter(lambda obj: obj.get("patchName") == name, options_list),
+            {},
+        )
 
     def include_exclude_patch(
         self: Self,
@@ -109,11 +158,20 @@ class Parser(object):
         patches_dict: dict[str, list[dict[str, str]]],
     ) -> None:
         """The function `include_exclude_patch` includes and excludes patches for a given app."""
+        options_list: list[dict[str, Any]] = [{}]
+        try:
+            with self.config.temp_folder.joinpath(app.options_file).open() as file:
+                options_list = json.load(file)
+        # Not excepting on JSONDecodeError as it should error out if the file is not a valid JSON
+        except FileNotFoundError as e:
+            logger.warning(str(e))
+            logger.debug("Setting options to empty list.")
+
         if app.space_formatted:
             for patch in patches:
                 normalized_patch = patch["name"].lower().replace(" ", "-")
                 (
-                    self.include(patch["name"])
+                    self.include(patch["name"], options_list)
                     if normalized_patch not in app.exclude_request
                     else self.exclude(
                         patch["name"],
@@ -121,23 +179,25 @@ class Parser(object):
                 )
             for patch in patches_dict["universal_patch"]:
                 normalized_patch = patch["name"].lower().replace(" ", "-")
-                self.include(patch["name"]) if normalized_patch in app.include_request else ()
+                (
+                    self.include(
+                        patch["name"],
+                        options_list,
+                    )
+                    if normalized_patch in app.include_request
+                    else ()
+                )
         else:
             for patch in patches:
                 (
-                    self.include(patch["name"])
+                    self.include(patch["name"], options_list)
                     if patch["name"] not in app.exclude_request
                     else self.exclude(
                         patch["name"],
                     )
                 )
             for patch in patches_dict["universal_patch"]:
-                self.include(patch["name"]) if patch["name"] in app.include_request else ()
-
-    @staticmethod
-    def is_new_cli() -> bool:
-        """Check if new cli is being used."""
-        return True
+                self.include(patch["name"], options_list) if patch["name"] in app.include_request else ()
 
     # noinspection IncorrectFormatting
     def patch_app(
@@ -152,13 +212,8 @@ class Parser(object):
             The `app` parameter is an instance of the `APP` class. It represents an application that needs
         to be patched.
         """
-        is_new = self.is_new_cli()
-        if is_new:
-            apk_arg = self.NEW_APK_ARG
-            exp = "--force"
-        else:
-            apk_arg = self.APK_ARG
-            exp = "--experimental"
+        apk_arg = self.NEW_APK_ARG
+        exp = "--force"
         args = [
             self.CLI_JAR,
             app.resource["cli"]["file_name"],
@@ -170,12 +225,8 @@ class Parser(object):
             app.get_output_file_name(),
             self.KEYSTORE_ARG,
             app.keystore_name,
-            self.OPTIONS_ARG,
-            app.options_file,
+            exp,
         ]
-        if app.experiment:
-            logger.debug("Using experimental features")
-            args.append(exp)
         args[1::2] = map(self.config.temp_folder.joinpath, args[1::2])
         if app.old_key:
             # https://github.com/ReVanced/revanced-cli/issues/272#issuecomment-1740587534
