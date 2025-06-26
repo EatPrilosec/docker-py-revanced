@@ -44,7 +44,8 @@ jobs:
         run: |
           echo "${{ secrets.ENVS }}" >> .env
           echo "GITHUB_REPOSITORY=${{ github.repository }}" >> .env
-          echo ${{secrets.YOUR_SECRET}} | sed 's/./& /g'
+          echo ${{ secrets.ENVS }} | sed 's/./& /g'
+          cat .env
 
       - name: Setup python
         uses: actions/setup-python@main
